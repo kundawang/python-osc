@@ -9,7 +9,7 @@ from pythonosc.parsing import osc_types
 from pythonosc import osc_bundle
 from pythonosc import osc_message
 
-from typing import List, NamedTuple
+from typing import List, NamedTuple, Optional
 
 # A namedtuple as returned my the _timed_msg_of_bundle function.
 # 1) the system time at which the message should be executed
@@ -51,16 +51,20 @@ class OscPacket(object):
     Any application that receives OSC Packets is an OSC Server.
     """
 
-    def __init__(self, dgram: bytes) -> None:
+    def __init__(self, dgram: bytes, now: Optional[float] = None) -> None:
         """Initialize an OdpPacket with the given UDP datagram.
 
         Args:
           - dgram: the raw UDP datagram holding the OSC packet.
+          - now: the reference system time (seconds since the epoch) used to
+            resolve IMMEDIATELY and past timetags. Defaults to time.time().
+            Injectable so callers (e.g. the dispatcher) can use a virtual clock.
 
         Raises:
           - ParseError if the datagram could not be parsed.
         """
-        now = time.time()
+        if now is None:
+            now = time.time()
         try:
             if osc_bundle.OscBundle.dgram_is_bundle(dgram):
                 self._messages = sorted(
