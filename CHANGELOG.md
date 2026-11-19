@@ -5,6 +5,13 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ## Unreleased
 
+- Added bounded bundle sending: a large bundle can be split into multiple
+  legal OSC bundles that each fit within a maximum datagram size and sent in
+  order over UDP (`bundle_splitter` module and
+  `UDPClient.send_fragmented_bundle`). Individual messages and nested bundles
+  are never split; build failures carry a zero `sent_count` and interrupted
+  sends report the number of datagrams already transmitted.
+
 ## [1.10.2]
 
 - Better asyncio handling, ability to ignore timetags for future messages

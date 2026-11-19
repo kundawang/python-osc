@@ -1,8 +1,28 @@
+import socket
+import time
 import unittest
 from unittest import mock
 
+from pythonosc import bundle_splitter
+from pythonosc import osc_bundle
+from pythonosc import osc_bundle_builder
 from pythonosc import osc_message_builder
+from pythonosc import osc_packet
 from pythonosc import udp_client
+
+# A whole-second timestamp in the future: integer seconds round-trip exactly
+# through the NTP timetag and OscPacket does not rewrite future timetags.
+TIMESTAMP = int(time.time()) + 3600
+SMALL_MTU = 108
+
+
+def _make_bundle(num_messages: int) -> osc_bundle.OscBundle:
+    builder = osc_bundle_builder.OscBundleBuilder(TIMESTAMP)
+    for index in range(num_messages):
+        msg_builder = osc_message_builder.OscMessageBuilder(address=f"/test/{index}")
+        msg_builder.add_arg(index)
+        builder.add_content(msg_builder.build())
+    return builder.build()
 
 
 class TestUdpClient(unittest.TestCase):
@@ -16,6 +36,119 @@ class TestUdpClient(unittest.TestCase):
 
         self.assertTrue(mock_socket.sendto.called)
         mock_socket.sendto.assert_called_once_with(msg.dgram, ("::1", 31337))
+
+
+class TestUdpClientBundledSend(unittest.TestCase):
+    @mock.patch("socket.socket")
+    def test_send_bundles_sends_each_datagram_in_order(self, mock_socket_ctor):
+        mock_socket = mock_socket_ctor.return_value
+        client = udp_client.UDPClient("::1", 31337)
+        fragments = bundle_splitter.split_bundle(_make_bundle(6), SMALL_MTU)
+
+        sent = client.send_bundles(fragments)
+
+        self.assertEqual(len(fragments), sent)
+        self.assertEqual(len(fragments), mock_socket.sendto.call_count)
+        expected_calls = [
+            mock.call(fragment.dgram, ("::1", 31337)) for fragment in fragments
+        ]
+        self.assertEqual(expected_calls, mock_socket.sendto.call_args_list)
+
+    @mock.patch("socket.socket")
+    def test_send_bundles_empty_sends_nothing(self, mock_socket_ctor):
+        mock_socket = mock_socket_ctor.return_value
+        client = udp_client.UDPClient("::1", 31337)
+        self.assertEqual(0, client.send_bundles([]))
+        mock_socket.sendto.assert_not_called()
+
+    @mock.patch("socket.socket")
+    def test_send_bundles_reports_sent_count_on_interruption(self, mock_socket_ctor):
+        mock_socket = mock_socket_ctor.return_value
+        client = udp_client.UDPClient("::1", 31337)
+        fragments = bundle_splitter.split_bundle(_make_bundle(6), SMALL_MTU)
+        mock_socket.sendto.side_effect = [None, OSError("network unreachable")]
+
+        with self.assertRaises(udp_client.BundleSendError) as context:
+            client.send_bundles(fragments)
+        self.assertEqual(1, context.exception.sent_count)
+        self.assertEqual(2, mock_socket.sendto.call_count)
+
+    @mock.patch("socket.socket")
+    def test_send_fragmented_bundle_sends_all_fragments(self, mock_socket_ctor):
+        mock_socket = mock_socket_ctor.return_value
+        client = udp_client.UDPClient("::1", 31337)
+        bundle = _make_bundle(6)
+        expected = bundle_splitter.split_bundle(bundle, SMALL_MTU)
+
+        sent = client.send_fragmented_bundle(bundle, SMALL_MTU)
+
+        self.assertEqual(len(expected), sent)
+        self.assertEqual(len(expected), mock_socket.sendto.call_count)
+
+    @mock.patch("socket.socket")
+    def test_send_fragmented_bundle_build_error_sends_nothing(self, mock_socket_ctor):
+        mock_socket = mock_socket_ctor.return_value
+        client = udp_client.UDPClient("::1", 31337)
+        bundle = _make_bundle(1)
+        with self.assertRaises(bundle_splitter.BundleBuildError) as context:
+            client.send_fragmented_bundle(bundle, bundle_splitter.BUNDLE_HEADER_SIZE)
+        # The packing error carries an explicit zero sent count.
+        self.assertEqual(0, context.exception.sent_count)
+        mock_socket.sendto.assert_not_called()
+
+    @mock.patch("socket.socket")
+    def test_send_fragmented_bundle_interruption_count(self, mock_socket_ctor):
+        mock_socket = mock_socket_ctor.return_value
+        client = udp_client.UDPClient("::1", 31337)
+        bundle = _make_bundle(100)
+        mock_socket.sendto.side_effect = [None, None, OSError("boom")]
+
+        with self.assertRaises(udp_client.BundleSendError) as context:
+            client.send_fragmented_bundle(bundle, SMALL_MTU)
+        self.assertEqual(2, context.exception.sent_count)
+
+
+class TestUdpClientBundledSendLoopback(unittest.TestCase):
+    """End-to-end check over a real loopback UDP socket."""
+
+    def setUp(self):
+        self.receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.receiver.bind(("127.0.0.1", 0))
+        self.receiver.settimeout(2.0)
+        self._port = self.receiver.getsockname()[1]
+
+    def tearDown(self):
+        self.receiver.close()
+
+    def test_100_messages_small_mtu_round_trip_in_order(self):
+        num_messages = 100
+        bundle = _make_bundle(num_messages)
+        client = udp_client.UDPClient("127.0.0.1", self._port)
+        try:
+            num_datagrams = client.send_fragmented_bundle(bundle, SMALL_MTU)
+        finally:
+            client.close()
+
+        received_addresses = []
+        datagram_sizes = []
+        for _ in range(num_datagrams):
+            data, _ = self.receiver.recvfrom(4096)
+            datagram_sizes.append(len(data))
+            packet = osc_packet.OscPacket(data)
+            # Every message in every packet carries the shared timetag.
+            for timed_message in packet.messages:
+                self.assertEqual(TIMESTAMP, timed_message.time)
+                received_addresses.append(timed_message.message.address)
+
+        # Every datagram respected the MTU...
+        self.assertTrue(all(size <= SMALL_MTU for size in datagram_sizes))
+        # ...and more than one datagram was needed for 100 messages.
+        self.assertGreater(num_datagrams, 1)
+        # Ordering and completeness across the whole transmission.
+        self.assertEqual(
+            [f"/test/{index}" for index in range(num_messages)],
+            received_addresses,
+        )
 
 
 class TestSimpleUdpClient(unittest.TestCase):

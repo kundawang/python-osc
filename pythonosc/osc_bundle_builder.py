@@ -1,6 +1,6 @@
 """Build OSC bundles for client applications."""
 
-from typing import List
+from typing import List, Union
 
 from pythonosc import osc_bundle
 from pythonosc import osc_message
@@ -17,7 +17,7 @@ class BuildError(Exception):
 class OscBundleBuilder(object):
     """Builds arbitrary OscBundle instances."""
 
-    def __init__(self, timestamp: int) -> None:
+    def __init__(self, timestamp: Union[int, float]) -> None:
         """Build a new bundle with the associated timestamp.
 
         Args:

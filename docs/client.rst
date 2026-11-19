@@ -28,6 +28,34 @@ Examples
         client.send_message("/some/address", 123)
 
 
+Sending bounded bundles
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+A bundle containing hundreds of updates can exceed the path's UDP datagram
+limit and be dropped.  ``send_fragmented_bundle`` splits one bundle's elements
+over several legal OSC bundles, each no larger than the given maximum datagram
+size, and sends them in order.  Individual messages and nested bundles are
+never split; if sending is interrupted, the raised ``BundleSendError`` exposes
+the number of datagrams already sent through ``sent_count``.
+
+.. code-block:: python
+
+    from pythonosc.osc_bundle_builder import OscBundleBuilder
+    from pythonosc.osc_message_builder import OscMessageBuilder
+    from pythonosc.udp_client import UDPClient
+
+    builder = OscBundleBuilder(0)
+    for i in range(500):
+        builder.add_content(OscMessageBuilder(address=f"/update/{i}").build())
+    big_bundle = builder.build()
+
+    client = UDPClient(ip, port)
+    num_sent = client.send_fragmented_bundle(big_bundle, max_datagram_size=1024)
+
+The splitting logic itself lives in :mod:`pythonosc.bundle_splitter` and can be
+used without a socket, for example to inspect the produced datagrams first.
+
+
 .. code-block:: python
 
     from pythonosc.tcp_client import SimpleTCPClient
@@ -44,6 +72,11 @@ Client Module Documentation
 ---------------------------------
 
 .. automodule:: pythonosc.udp_client
+  :special-members:
+  :members:
+  :exclude-members: __weakref__
+
+.. automodule:: pythonosc.bundle_splitter
   :special-members:
   :members:
   :exclude-members: __weakref__

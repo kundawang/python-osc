@@ -8,12 +8,30 @@ else:
     from collections import Iterable
 
 import socket
-from typing import Generator, Union
+from typing import Generator, Iterable as TIterable, Union
 
+from pythonosc import bundle_splitter
 from pythonosc.dispatcher import Dispatcher
 from pythonosc.osc_bundle import OscBundle
 from pythonosc.osc_message import OscMessage
 from pythonosc.osc_message_builder import ArgValue, OscMessageBuilder
+
+
+class BundleSendError(OSError):
+    """Raised when sending a sequence of bounded bundles is interrupted.
+
+    The bundles produced before the failing socket operation have already been
+    handed to the OS, so callers need to know how far the send progressed.
+    """
+
+    def __init__(self, message: str, sent_count: int) -> None:
+        super().__init__(message)
+        self._sent_count = sent_count
+
+    @property
+    def sent_count(self) -> int:
+        """Number of datagrams successfully sent before the failure."""
+        return self._sent_count
 
 
 class UDPClient(object):
@@ -80,6 +98,59 @@ class UDPClient(object):
             content: Message or bundle to be sent
         """
         self._sock.sendto(content.dgram, (self._address, self._port))
+
+    def send_bundles(self, bundles: TIterable[OscBundle]) -> int:
+        """Send several bundles in order, one datagram per bundle.
+
+        Args:
+            bundles: bundles to send, in transmission order.
+
+        Returns:
+            the number of datagrams actually sent.
+
+        Raises:
+            BundleSendError: if a socket operation fails midway. The number
+                of datagrams already sent is available on the exception's
+                ``sent_count`` attribute.
+        """
+        sent_count = 0
+        for bundle in bundles:
+            try:
+                self.send(bundle)
+            except OSError as ose:
+                raise BundleSendError(
+                    f"Sending bundle {sent_count} failed: {ose}", sent_count
+                ) from ose
+            sent_count += 1
+        return sent_count
+
+    def send_fragmented_bundle(self, bundle: OscBundle, max_datagram_size: int) -> int:
+        """Split one bundle into bounded datagrams and send them in order.
+
+        The elements sharing ``bundle``'s timetag are distributed over several
+        legal OSC bundles, each no larger than ``max_datagram_size``, and sent
+        sequentially. Individual messages and nested bundles are never split.
+
+        Args:
+            bundle: the bundle whose elements should be distributed.
+            max_datagram_size: maximum size in bytes of any emitted datagram.
+
+        Returns:
+            the number of datagrams actually sent.
+
+        Raises:
+            bundle_splitter.BundleBuildError: if the bundle cannot be split
+                (empty input, a limit smaller than the bundle header, a
+                timetag mismatch, or an element that does not fit alone).
+                Nothing has been sent when this is raised.
+            BundleSendError: if a socket operation fails midway. The number
+                of datagrams already sent is available on the exception's
+                ``sent_count`` attribute.
+        """
+        # Build everything first: a packing failure must not leave
+        # partially transmitted state.
+        fragments = bundle_splitter.split_bundle(bundle, max_datagram_size)
+        return self.send_bundles(fragments)
 
     def receive(self, timeout: float | None = None) -> bytes:
         """Wait :int:`timeout` seconds for a message an return the raw bytes
